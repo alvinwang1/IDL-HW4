@@ -85,26 +85,14 @@ class SequenceGenerator:
         if penalty == 1.0:
             return logits
         
-        # Handle both regular and beam search shapes
+        mask = torch.zeros_like(logits, dtype=torch.bool)
         if logits.dim() == 2:
-            # Greedy search: (batch_size, vocab_size)
-            for idx in range(sequences.size(0)):
-                unique_tokens = torch.unique(sequences[idx])
-                logits[idx, unique_tokens] = logits[idx, unique_tokens] / torch.where(
-                    logits[idx, unique_tokens] > 0,
-                    torch.full_like(logits[idx, unique_tokens], penalty),
-                    torch.full_like(logits[idx, unique_tokens], 1.0/penalty)
-                )
+            mask.scatter_(1, sequences, True)
         else:
-            # Beam search: (batch_size, beam_width, vocab_size)
-            for batch_idx in range(sequences.size(0)):
-                for beam_idx in range(sequences.size(1)):
-                    unique_tokens = torch.unique(sequences[batch_idx, beam_idx])
-                    logits[batch_idx, beam_idx, unique_tokens] = logits[batch_idx, beam_idx, unique_tokens] / torch.where(
-                        logits[batch_idx, beam_idx, unique_tokens] > 0,
-                        torch.full_like(logits[batch_idx, beam_idx, unique_tokens], penalty),
-                        torch.full_like(logits[batch_idx, beam_idx, unique_tokens], 1.0/penalty)
-                    )
+            mask.scatter_(2, sequences, True)
+            
+        penalty_factor = torch.where(logits > 0, penalty, 1.0/penalty)
+        logits = torch.where(mask, logits / penalty_factor, logits)
         
         return logits
 
@@ -232,13 +220,9 @@ class SequenceGenerator:
             if finished.all():
                 break
 
-            all_next_scores = []
-            for i in range(beam_width):
-                beam_i_seqs = sequences[:, i, :]
-                next_scores_i = self.score_fn(beam_i_seqs)
-                all_next_scores.append(next_scores_i)
-            
-            next_scores = torch.stack(all_next_scores, dim=1) # (batch_size, beam_width, vocab_size)
+            flat_sequences = sequences.view(batch_size * beam_width, -1)
+            flat_next_scores = self.score_fn(flat_sequences)
+            next_scores = flat_next_scores.view(batch_size, beam_width, -1) # (batch_size, beam_width, vocab_size)
             next_scores = self._apply_repeat_penalty(next_scores, sequences, repeat_penalty)
             next_scores = next_scores / temperature
             

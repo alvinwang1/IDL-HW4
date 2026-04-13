@@ -160,7 +160,7 @@ class ASRDataset(Dataset):
             
             if self.partition != "test-clean":
                 # Important Note: This is a very important line of code and you should check whether your transcript is correct after loading (and very dependent in evaluation)
-                transcript = str(np.load(os.path.join(self.text_dir, self.text_files[i])))
+                transcript = ''.join(np.load(os.path.join(self.text_dir, self.text_files[i])))  
 
                 self.total_chars += len(transcript)
 

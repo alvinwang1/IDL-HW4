@@ -165,7 +165,6 @@ class ASRTrainer(BaseTrainer):
             # Clean up
             del feats, targets_shifted, targets_golden, feat_lengths, transcript_lengths
             del seq_out, curr_att, ctc_inputs, loss
-            torch.cuda.empty_cache()
 
         # Handle remaining gradients
         if (len(dataloader) % self.config['training']['gradient_accumulation_steps']) != 0:
@@ -393,7 +392,16 @@ class ASRTrainer(BaseTrainer):
                 
                 # Define scoring function for this batch
                 def get_score(x):
-                    asr_logits = self.model.score(x, encoder_output, pad_mask_src)
+                    curr_batch_size = x.size(0)
+                    beam_width = curr_batch_size // encoder_output.size(0)
+                    if beam_width > 1:
+                        enc_out = encoder_output.repeat_interleave(beam_width, dim=0)
+                        pad_mask = pad_mask_src.repeat_interleave(beam_width, dim=0)
+                    else:
+                        enc_out = encoder_output
+                        pad_mask = pad_mask_src
+                        
+                    asr_logits = self.model.score(x, enc_out, pad_mask)
                     if recognition_config.get('lm_model') is not None:
                         lm_logits = recognition_config['lm_model'].score(x)
                         return asr_logits + recognition_config['lm_weight'] * lm_logits
@@ -424,7 +432,6 @@ class ASRTrainer(BaseTrainer):
 
                 # Clean up
                 del feats, feat_lengths, encoder_output, pad_mask_src, prompts
-                torch.cuda.empty_cache()
 
                 # Post process sequences
                 post_processed_preds = generator.post_process_sequence(seqs, self.tokenizer)
