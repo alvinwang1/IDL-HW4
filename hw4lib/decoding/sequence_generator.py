@@ -84,16 +84,27 @@ class SequenceGenerator:
         """
         if penalty == 1.0:
             return logits
-        
-        mask = torch.zeros_like(logits, dtype=torch.bool)
-        if logits.dim() == 2:
-            mask.scatter_(1, sequences, True)
-        else:
-            mask.scatter_(2, sequences, True)
             
-        penalty_factor = torch.where(logits > 0, penalty, 1.0/penalty)
-        logits = torch.where(mask, logits / penalty_factor, logits)
+        b_size = sequences.shape[0]
         
+        if logits.dim() == 2:
+            for i in range(b_size):
+                visited_tokens = torch.unique(sequences[i])
+                pos_mask = logits[i, visited_tokens] > 0
+                
+                penalty_values = torch.where(pos_mask, penalty, 1.0 / penalty)
+                logits[i, visited_tokens] = logits[i, visited_tokens] / penalty_values
+                
+        else:
+            beam_count = sequences.shape[1]
+            for i in range(b_size):
+                for j in range(beam_count):
+                    visited_tokens = torch.unique(sequences[i, j])
+                    pos_mask = logits[i, j, visited_tokens] > 0
+                    
+                    penalty_values = torch.where(pos_mask, penalty, 1.0 / penalty)
+                    logits[i, j, visited_tokens] = logits[i, j, visited_tokens] / penalty_values
+                    
         return logits
 
     def _filter_logits(
@@ -205,64 +216,55 @@ class SequenceGenerator:
             raise ValueError("max_length must be >= input sequence length")
         
         batch_size = x.size(0)
+        seq_start_len = x.size(1)
         
-        with torch.no_grad():
-            sample_logits = self.score_fn(x)
-            vocab_size = sample_logits.size(-1)
-
         sequences = x.unsqueeze(1).repeat(1, beam_width, 1)
         scores = torch.full((batch_size, beam_width), float('-inf'), device=x.device)
         scores[:, 0] = 0.0
         
         finished = torch.zeros((batch_size, beam_width), dtype=torch.bool, device=x.device)
 
-        for _ in range(self.max_length - x.size(1)):
+        for _ in range(self.max_length - seq_start_len):
             if finished.all():
                 break
 
-            flat_sequences = sequences.view(batch_size * beam_width, -1)
-            flat_next_scores = self.score_fn(flat_sequences)
-            next_scores = flat_next_scores.view(batch_size, beam_width, -1) # (batch_size, beam_width, vocab_size)
-            next_scores = self._apply_repeat_penalty(next_scores, sequences, repeat_penalty)
-            next_scores = next_scores / temperature
+            step_probabilities = []
+            cur_seq_length = sequences.size(-1)
             
-            log_probs = torch.log_softmax(next_scores, dim=-1)
-            is_finished = finished.unsqueeze(-1).expand(-1, -1, vocab_size)
-            eos_mask = torch.zeros(vocab_size, dtype=torch.bool, device=x.device)
-            eos_mask[self.tokenizer.eos_id] = True
-            
-            log_probs = torch.where(
-                is_finished,
-                torch.where(eos_mask, torch.zeros_like(log_probs), torch.full_like(log_probs, float('-inf'))),
-                log_probs
-            )
-
-            total_scores = scores.unsqueeze(-1) + log_probs
-            total_scores = total_scores.view(batch_size, -1)
-            
-            topk_scores, topk_indices = torch.topk(total_scores, beam_width, dim=-1)
-            
-            beam_indices = topk_indices // vocab_size
-            token_indices = topk_indices % vocab_size
-            
-            new_sequences = torch.zeros((batch_size, beam_width, sequences.size(2) + 1), dtype=torch.long, device=x.device)
-            new_finished = torch.zeros((batch_size, beam_width), dtype=torch.bool, device=x.device)
-            
-            for b in range(batch_size):
-                b_beam_indices = beam_indices[b]
-                b_tok_indices = token_indices[b]
+            for b_idx in range(beam_width):
+                active_beam = sequences[:, b_idx, :]
                 
-                selected_seqs = sequences[b, b_beam_indices]
-                new_sequences[b] = torch.cat([selected_seqs, b_tok_indices.unsqueeze(-1)], dim=-1)
+                logits = self.score_fn(active_beam)
+                logits = logits / temperature
+                logits = self._apply_repeat_penalty(logits, active_beam, repeat_penalty)
                 
-                b_finished = finished[b, b_beam_indices]
+                log_probs = torch.log_softmax(logits, dim=-1)
                 
-                is_eos = (b_tok_indices == self.tokenizer.eos_id)
-                new_finished[b] = b_finished | is_eos
-
-            sequences = new_sequences
-            scores = topk_scores
-            finished = new_finished
+                if finished[:, b_idx].any():
+                    zero_pad = torch.full_like(log_probs, float("-inf"))
+                    zero_pad[:, self.tokenizer.eos_id] = 0.0
+                    log_probs = torch.where(finished[:, b_idx].unsqueeze(1), zero_pad, log_probs)
+                    
+                step_probabilities.append(log_probs)
+                
+            stacked_probs = torch.stack(step_probabilities, dim=1)
+            
+            new_candidate_scores = scores.unsqueeze(-1) + stacked_probs
+            combined_scores = new_candidate_scores.view(batch_size, beam_width * self.tokenizer.vocab_size)
+            
+            top_new_scores, top_indices = torch.topk(combined_scores, beam_width, dim=-1)
+            
+            prev_beam_idx = top_indices // self.tokenizer.vocab_size
+            next_tokens = top_indices % self.tokenizer.vocab_size
+            
+            gather_shape = prev_beam_idx.unsqueeze(-1).expand(-1, -1, cur_seq_length)
+            best_prefixes = torch.gather(sequences, 1, gather_shape)
+            
+            sequences = torch.cat([best_prefixes, next_tokens.unsqueeze(-1)], dim=-1)
+            
+            inherited_finished = torch.gather(finished, 1, prev_beam_idx)
+            finished = inherited_finished | (next_tokens == self.tokenizer.eos_id)
+            scores = top_new_scores
             
         return sequences, scores
 
