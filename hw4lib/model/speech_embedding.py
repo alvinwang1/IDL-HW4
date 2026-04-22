@@ -196,11 +196,8 @@ class Conv2DSubsampling(torch.nn.Module):
             torch.nn.GELU(),
         )
 
-        linear_in_dim = self.calculate_downsampled_length(input_dim, 1, 1)
-        linear_in_dim *= output_dim
-        # TODO: Replace the Linear layer with adaptive pooling and test the performance
-        self.freq_pool = torch.nn.AdaptiveAvgPool2d((None, 1))  # Pool across frequency only
-        self.linear_out = torch.nn.Linear(output_dim, output_dim)
+        frequency_dim = self.calculate_downsampled_length(input_dim, 1, 1)
+        self.linear_out = torch.nn.Linear(output_dim * frequency_dim, output_dim)
         self.dropout = torch.nn.Dropout(dropout)
 
     def forward(self, x, x_len):
@@ -215,9 +212,9 @@ class Conv2DSubsampling(torch.nn.Module):
         x = x.unsqueeze(1)  # Add a channel dimension for Conv2D
         x = self.conv(x)
         
-        # TODO: Apply frequency pooling and reshape
-        x = self.freq_pool(x)  # (batch, channels, time, 1)
-        x = x.squeeze(-1).transpose(1, 2)  # (batch, time, channels)
+        # Flatten the frequency and channel dimensions
+        batch, channels, time, freq = x.size()
+        x = x.transpose(1, 2).reshape(batch, time, channels * freq)
         
         x = self.linear_out(x) # (batch, time, channels)
         x = self.dropout(x)
